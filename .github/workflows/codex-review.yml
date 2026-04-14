@@ -1,0 +1,127 @@
+# Codex PR Review ワークフロー
+# セルフホストランナー上で Codex CLI を使って PR を自動レビューする。
+#
+# 前提条件:
+#   - セルフホストランナーに codex, gh, pwsh がインストール済み
+#   - ランナーラベル: self-hosted, codex-review
+
+name: Codex PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, master]  # 保護ブランチへの PR のみ
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # ドラフト PR はスキップ。fork からの PR はセキュリティ上ブロック。
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, codex-review]
+    timeout-minutes: 30
+
+    # pwsh はすべての GitHub Actions ランナーで利用可能
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      # -----------------------------------------------------------------
+      # セキュリティ: スクリプトと設定はデフォルトブランチから取得する。
+      # PR ヘッドのスクリプトは実行しない（改竄防止）。
+      # -----------------------------------------------------------------
+
+      # Windows の 260 文字パス制限を回避
+      - name: Git の長いファイル名を許可
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - name: レビュー対象コード（PR ヘッド）をチェックアウト
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-code
+          # shallow clone（高速化）。ベースブランチは次のステップで fetch する。
+          fetch-depth: 1
+          # バイナリはレビュー不要
+          lfs: false
+
+      - name: 信頼済みスクリプトと設定をデフォルトブランチからチェックアウト
+        uses: actions/checkout@v4
+        with:
+          # ブランチ名ではなく SHA で固定（イベント後の base 更新による非決定性を防止）
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          sparse-checkout: .github/codex-review
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          lfs: false
+
+      # three-dot diff (A...B) に必要な merge-base を解決するため、
+      # ベースブランチの履歴を段階的に取得する
+      - name: ベースブランチを fetch して merge-base を確保
+        working-directory: pr-code
+        run: |
+          git fetch origin $env:BASE_REF --depth=1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::BASE_REF の fetch に失敗" }
+          git fetch origin $env:HEAD_REF --depth=1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::HEAD_REF の fetch に失敗" }
+
+          foreach ($depth in @(32, 128, 512, 0)) {
+            $null = git merge-base "origin/$($env:BASE_REF)" HEAD 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "merge-base 解決済み"
+              break
+            }
+            if ($depth -eq 0) {
+              Write-Host "::warning::全履歴を取得します"
+              git fetch --unshallow origin 2>&1
+              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::unshallow に失敗" }
+            } else {
+              git fetch "--deepen=$depth" origin $env:BASE_REF 2>&1
+              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::deepen=$depth (BASE_REF) に失敗" }
+              git fetch "--deepen=$depth" origin $env:HEAD_REF 2>&1
+              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::deepen=$depth (HEAD_REF) に失敗" }
+            }
+          }
+
+          # 最終確認（レビュー自体は続行するので、exit code をリセットする）
+          $null = git merge-base "origin/$($env:BASE_REF)" HEAD 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::merge-base を解決できませんでした。インラインコメントが正しく配置されない可能性があります。"
+          }
+          exit 0
+
+      - name: Codex でレビュー実行
+        id: review
+        working-directory: pr-code
+        env:
+          TRUSTED_CONFIG: ${{ github.workspace }}/trusted/.github/codex-review/config.yml
+        run: |
+          & "${{ github.workspace }}/trusted/.github/codex-review/review.ps1"
+
+      - name: レビュー結果を PR に投稿
+        if: always() && steps.review.outcome != 'skipped'
+        working-directory: pr-code
+        run: |
+          & "${{ github.workspace }}/trusted/.github/codex-review/post-review.ps1"
